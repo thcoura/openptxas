@@ -289,6 +289,34 @@ def _f64_to_gpr(name: str, ctx, output: list) -> int:
     return t
 
 
+def _f64_imm_to_gpr(op, ctx, output: list) -> int:
+    """Materialize a 64-bit FP64 IMMEDIATE (op.value = raw IEEE-754 bits, from a PTX `0d...` literal)
+    into an even-aligned GPR pair (lo at R, hi at R+1) via two MOV32I, and return the lo GPR index.
+    Mirrors _f64_to_gpr's register-pair convention so the f64 arithmetic/compare selectors below can
+    accept an immediate source — e.g. `fma.f64 d, a, 0d..., 0d...` or `mul.f64 d, a, 0d...` — instead of
+    crashing on `.name` (an ImmOp has no name). Fixes the openptxas AttributeError that disabled the
+    compile_gate B22 differential."""
+    from sass.encoding.sm_120_opcodes import encode_mov32i
+    bits = op.value & 0xFFFFFFFFFFFFFFFF
+    lo = bits & 0xFFFFFFFF
+    hi = (bits >> 32) & 0xFFFFFFFF
+    t = _alloc_gpr(ctx)
+    if t % 2 != 0:
+        t = _alloc_gpr(ctx)
+    _alloc_gpr(ctx)  # reserve t+1 (the hi half of the f64 pair)
+    output.append(SassInstr(encode_mov32i(t, lo), f'MOV32I R{t}, 0x{lo:08x}  // f64 imm lo'))
+    output.append(SassInstr(encode_mov32i(t + 1, hi), f'MOV32I R{t + 1}, 0x{hi:08x}  // f64 imm hi'))
+    return t
+
+
+def _f64_src_to_gpr(op, ctx, output: list) -> int:
+    """An f64 SOURCE operand → lo GPR index, handling BOTH a register (RegOp/UR-param, via _f64_to_gpr)
+    AND an immediate (ImmOp, via _f64_imm_to_gpr). Use this everywhere an f64 source could be a literal."""
+    if isinstance(op, ImmOp):
+        return _f64_imm_to_gpr(op, ctx, output)
+    return _f64_to_gpr(op.name, ctx, output)
+
+
 def _alloc_scratch(ctx: 'ISelContext', count: int = 1) -> list[int]:
     """Allocate scratch GPRs from the pool. Returns list of register indices."""
     regs = []
@@ -2067,11 +2095,14 @@ def _select_atom_cas(instr: Instruction, ra: RegAlloc,
     if not isinstance(addr_op, MemOp):
         raise ISelError("atom.cas addr must be MemOp")
     d   = ra.r32(dest_op.name)
-    cmp = ra.r32(cmp_op.name)
-    nv  = ra.r32(new_op.name)
+    # nvcc emits atom.cas with an immediate comparand and/or new value
+    # (e.g. `atom.global.cas.b32 %r, [%rd], 0, 1`).  Materialize any ImmOp
+    # into a scratch GPR (MOV R, imm) before the ATOMG.
+    prefix = []
+    cmp = _materialize_imm(cmp_op, ctx, ra, prefix)
+    nv  = _materialize_imm(new_op, ctx, ra, prefix)
 
     # Resolve address: prefer GPR (if written by add.u64) over stale UR entry
-    prefix = []
     base_name = addr_op.base if addr_op.base.startswith('%') else f'%{addr_op.base}'
     ur_params = getattr(ctx, '_ur_params', {}) if ctx else {}
     deferred = getattr(ctx, '_deferred_ur_params', {}) if ctx else {}
@@ -2095,6 +2126,15 @@ def _select_atom_cas(instr: Instruction, ra: RegAlloc,
         prefix.extend(_emit_ur_to_gpr(addr, ur_idx, "UR->GPR addr"))
     else:
         addr = RZ
+
+    # Soundness guard: a materialized immediate comparand/new-value must not
+    # alias the address register (_alloc_gpr is liveness-blind, so a tight
+    # scratch pool could hand back the address reg → silently-wrong CAS).
+    # Fail-closed rather than miscompile.
+    if addr != RZ and (addr == cmp or addr == nv):
+        raise ISelError(
+            f"atom.cas register aliasing: addr R{addr} collides with "
+            f"cmp R{cmp}/nv R{nv} (materialized-immediate scratch clash)")
 
     return prefix + [SassInstr(encode_atomg_cas_b32(d, addr, cmp, nv),
                       f'ATOMG.E.CAS.b32 R{d}, [R{addr}], R{cmp}, R{nv}')]
@@ -4134,6 +4174,30 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     _emit_lop3(output, ctx, d_lo, a_lo, RZ, RZ, 0x0F, f'LOP3.LUT R{d_lo}, R{a_lo}, RZ, RZ, 0x0f  // not.{typ} lo')
                     _emit_lop3(output, ctx, d_lo+1, a_lo+1, RZ, RZ, 0x0F, f'LOP3.LUT R{d_lo+1}, R{a_lo+1}, RZ, RZ, 0x0f  // not.{typ} hi')
 
+                elif op in ('mov', 'not') and typ == 'pred':
+                    # Predicate move / negate → PLOP3 (predicate LOP3).
+                    # Standard NVIDIA immLut convention (a=src0=0xf0): the
+                    # result depends only on src0, so src1/src2 = PT(7).
+                    #   mov.pred Pd, Pa   → copy a  → lut 0xf0
+                    #   mov.pred Pd, -1   → all-true  → lut 0xff   (nonzero imm)
+                    #   mov.pred Pd, 0    → all-false → lut 0x00
+                    #   not.pred Pd, Pa   → ~a      → lut 0x0f
+                    from sass.encoding.sm_120_opcodes import encode_plop3
+                    pd = ctx.ra.pred(instr.dest.name)
+                    src = instr.srcs[0]
+                    if isinstance(src, ImmOp):
+                        # mov.pred with constant; not.pred with constant inverts.
+                        truth = bool(src.value & 0xFFFFFFFF)
+                        if op == 'not':
+                            truth = not truth
+                        lut, pa = (0xFF if truth else 0x00), 7
+                    else:
+                        pa = ctx.ra.pred(src.name) if src.name in ctx.ra.pred_regs else 7
+                        lut = 0x0F if op == 'not' else 0xF0
+                    out = [SassInstr(encode_plop3(pd, pa, 7, 7, lut=lut),
+                            f'PLOP3 P{pd}, P{pa}, PT, PT, 0x{lut:02x}  // {op}.pred')]
+                    output.extend(_apply_pred_byte(out, instr, ctx))
+
                 elif op == 'mul' and 'lo' in instr.types and typ in ('u32', 's32'):
                     if (isinstance(instr.srcs[0], ImmOp)
                             and isinstance(instr.srcs[1], RegOp)):
@@ -4847,8 +4911,8 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
 
                 elif op == 'add' and typ == 'f64':
                     d = ctx.ra.lo(instr.dest.name)
-                    a = _f64_to_gpr(instr.srcs[0].name, ctx, output)
-                    b = _f64_to_gpr(instr.srcs[1].name, ctx, output)
+                    a = _f64_src_to_gpr(instr.srcs[0], ctx, output)
+                    b = _f64_src_to_gpr(instr.srcs[1], ctx, output)
                     output.append(SassInstr(encode_dadd(d, a, b),
                                             f'DADD R{d}, R{a}, R{b}  // add.f64'))
 
@@ -4856,30 +4920,31 @@ def select_function(fn: Function, ctx: ISelContext) -> list[SassInstr]:
                     # sub.f64 d, a, b → d = a - b = -b + a → DADD d, -b, a
                     # Mirrors sub.f32 which uses FADD(d, b, a, negate_src0=True).
                     d = ctx.ra.lo(instr.dest.name)
-                    a = _f64_to_gpr(instr.srcs[0].name, ctx, output)
-                    b = _f64_to_gpr(instr.srcs[1].name, ctx, output)
+                    a = _f64_src_to_gpr(instr.srcs[0], ctx, output)
+                    b = _f64_src_to_gpr(instr.srcs[1], ctx, output)
                     output.append(SassInstr(encode_dadd(d, b, a, negate_src0=True),
                                             f'DADD R{d}, -R{b}, R{a}  // sub.f64'))
 
                 elif op == 'mul' and typ == 'f64':
                     d = ctx.ra.lo(instr.dest.name)
-                    a = _f64_to_gpr(instr.srcs[0].name, ctx, output)
-                    b = _f64_to_gpr(instr.srcs[1].name, ctx, output)
+                    a = _f64_src_to_gpr(instr.srcs[0], ctx, output)
+                    b = _f64_src_to_gpr(instr.srcs[1], ctx, output)
                     output.append(SassInstr(encode_dmul(d, a, b),
                                             f'DMUL R{d}, R{a}, R{b}  // mul.f64'))
 
                 elif op == 'fma' and typ == 'f64':
                     d = ctx.ra.lo(instr.dest.name)
-                    a = _f64_to_gpr(instr.srcs[0].name, ctx, output)
-                    b_ur = ctx._ur_params.get(instr.srcs[1].name) if ctx else None
-                    c_ur = ctx._ur_params.get(instr.srcs[2].name) if ctx else None
+                    a = _f64_src_to_gpr(instr.srcs[0], ctx, output)
+                    # Only a NAMED operand (RegOp) can be a UR param; an ImmOp has no name → not UR.
+                    b_ur = ctx._ur_params.get(instr.srcs[1].name) if (ctx and isinstance(instr.srcs[1], RegOp)) else None
+                    c_ur = ctx._ur_params.get(instr.srcs[2].name) if (ctx and isinstance(instr.srcs[2], RegOp)) else None
                     if b_ur is not None and c_ur is not None:
                         # Both multiplier and addend are in UR — DFMA R-R-UR-UR
                         output.append(SassInstr(encode_dfma_ur_ur(d, a, b_ur, c_ur),
                                                 f'DFMA R{d}, R{a}, UR{b_ur}, UR{c_ur}  // fma.f64 (UR×UR)'))
                     else:
-                        b = _f64_to_gpr(instr.srcs[1].name, ctx, output)
-                        c = _f64_to_gpr(instr.srcs[2].name, ctx, output)
+                        b = _f64_src_to_gpr(instr.srcs[1], ctx, output)
+                        c = _f64_src_to_gpr(instr.srcs[2], ctx, output)
                         output.append(SassInstr(encode_dfma(d, a, b, c),
                                                 f'DFMA R{d}, R{a}, R{b}, R{c}  // fma.f64'))
 
